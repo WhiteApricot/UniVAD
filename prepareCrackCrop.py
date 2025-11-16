@@ -2,195 +2,237 @@ import os
 import cv2
 import numpy as np
 import shutil
-from glob import glob
+import random
 from tqdm import tqdm
-import sys
-import random  # 导入 random 库用于采样
-
-# --- 配置 ---
-SOURCE_ROOT = 'CRACK500FINAL'  # 您的原始数据存放的根目录
-OUTPUT_DATASET_NAME = 'RoadCrack_Crop'  # 新数据集的名称
-CLASS_NAME = 'road_texture'  # 您数据唯一的类别名
-
-# 最终裁切出的“纯净矩形”的面积，必须大于原图总面积的这个比例
-MIN_NORMAL_AREA_RATIO = 0.4
-
-# --- !!! 新增：小规模测试的采样比例 !!! ---
-# 1.0 = 使用 100% 的数据 (完整测试)
-# 0.1 = 使用 10% 的数据 (快速测试)
-SAMPLE_RATIO = 0.1
-# --- 结束新增 ---
-
-# 原始数据路径
-SOURCE_IMAGE_DIR = os.path.join(SOURCE_ROOT, 'JPEGImages')
-SOURCE_MASK_DIR = os.path.join(SOURCE_ROOT, 'SegmentationClass')
-
-# UniVAD 格式的目标路径
-BASE_OUTPUT_DIR = os.path.join('data', OUTPUT_DATASET_NAME)
-CLASS_OUTPUT_DIR = os.path.join(BASE_OUTPUT_DIR, CLASS_NAME)
-
-TRAIN_GOOD_DIR = os.path.join(CLASS_OUTPUT_DIR, 'train', 'good')
-TEST_CRACK_DIR = os.path.join(CLASS_OUTPUT_DIR, 'test', 'crack')
-GT_CRACK_DIR = os.path.join(CLASS_OUTPUT_DIR, 'ground_truth', 'crack')
-TEST_GOOD_DIR = os.path.join(CLASS_OUTPUT_DIR, 'test', 'good')
 
 
-def find_largest_pure_rectangle(image, mask):
+def find_largest_pure_rectangle(mask_path):
     """
-    在图像中找到最大的、100%纯净的矩形。
-    掩码中：0=正常, 255=裂缝
+    (最终修正版)
+    加载掩码 (0=正常, 255=裂缝)，并使用 "最大矩形直方图" 算法
+    找到全局最大的、100%纯净（全0）的矩形。
+
+    该区域面积必须不小于原图的40%。
     """
 
-    # 1. 反转掩码，使 255=正常, 0=裂缝
-    normal_mask = cv2.bitwise_not(mask)
+    # 1. 以灰度模式加载掩码
+    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        print(f"警告: 无法加载掩码 {mask_path}。跳过此文件。")
+        return None
 
-    # 2. 找到所有“正常”区域的轮廓
-    contours, _ = cv2.findContours(normal_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # 2. 获取原图总面积和40%阈值
+    height, width = mask.shape
+    total_area = height * width
+    min_required_area = total_area * 0.4
 
-    if not contours:
-        return None  # 没有找到正常区域
+    # 3. 反转掩码，使 0=裂缝, 1=正常
+    # 我们寻找 "0" (正常) 区域，所以将 0 变为 1
+    normal_mask = (mask == 0).astype(np.uint8)
 
-    # 3. 找到面积最大的“正常”轮廓
-    try:
-        max_contour = max(contours, key=cv2.contourArea)
-    except ValueError:
-        return None  # 轮廓可能为空或无效
+    # 4. 基于 "最大矩形直方图" 的动态规划
 
-    # 4. 获取这个最大轮廓的“脏”边界框 (x, y, w, h)
-    x, y, w, h = cv2.boundingRect(max_contour)
+    # hist (histogram) 存储从 (y, x) 向上连续为 1 (正常) 的高度
+    hist = np.zeros(width, dtype=int)
+    max_area = 0
+    best_rect = (0, 0, 0, 0)  # x, y, w, h
 
-    # 5. 创建一个只包含最大正常轮廓的“查询掩码”
-    query_mask = np.zeros_like(normal_mask)
-    cv2.drawContours(query_mask, [max_contour], -1, 255, -1)  # 填充轮廓
+    for y in range(height):
+        # 4.1 更新当前行的直方图
+        for x in range(width):
+            # 如果当前 (y, x) 是正常的 (1)，则高度+1；否则重置为0
+            hist[x] = hist[x] + 1 if normal_mask[y, x] == 1 else 0
 
-    # 6. 开始收缩
-    x1, y1 = x, y
-    x2, y2 = x + w, y + h
+        # 4.2 在当前直方图 (hist) 中寻找最大矩形
+        # O(N) 栈 (stack) 解决方案
+        stack = [-1]
+        for i, h in enumerate(hist):
+            # 当遇到比栈顶更矮的柱子时，开始计算
+            while stack[-1] != -1 and hist[stack[-1]] >= h:
+                h_pop = hist[stack.pop()]  # 弹出的柱子高度
+                w_pop = i - stack[-1] - 1  # 宽度
+                area = h_pop * w_pop
 
-    # 检查上边界 (y1)
-    while y1 < y2:
-        if np.all(query_mask[y1, x1:x2] == 255): break
-        y1 += 1
-    if y1 >= y2: return None  # 无法找到纯净区域
+                if area > max_area:
+                    max_area = area
+                    # (y - h_pop + 1) 是矩形的起始 y 坐标
+                    best_rect = (stack[-1] + 1, y - h_pop + 1, w_pop, h_pop)
+            stack.append(i)
 
-    # 检查下边界 (y2)
-    while y2 > y1:
-        if np.all(query_mask[y2 - 1, x1:x2] == 255): break
-        y2 -= 1
-    if y1 >= y2: return None
+        # 4.3 处理栈中剩余的柱子 (它们可以一直延伸到最右边)
+        while stack[-1] != -1:
+            h_pop = hist[stack.pop()]
+            w_pop = width - stack[-1] - 1  # 宽度延伸到尽头
+            area = h_pop * w_pop
 
-    # 检查左边界 (x1)
-    while x1 < x2:
-        if np.all(query_mask[y1:y2, x1] == 255): break
-        x1 += 1
-    if x1 >= x2: return None
+            if area > max_area:
+                max_area = area
+                best_rect = (stack[-1] + 1, y - h_pop + 1, w_pop, h_pop)
 
-    # 检查右边界 (x2)
-    while x2 > x1:
-        if np.all(query_mask[y1:y2, x2 - 1] == 255): break
-        x2 -= 1
-    if x1 >= x2: return None
+    # 5. 检查面积是否达到40% (已删除 print 提示)
+    if max_area < min_required_area:
+        return None
 
-    # 7. 裁切原始图像
-    cropped_pure_image = image[y1:y2, x1:x2]
+    # 安全检查，防止找到 0 面积
+    if best_rect[2] == 0 or best_rect[3] == 0:
+        return None
 
-    return cropped_pure_image
+    return best_rect
+
+
+def process_and_save(file_list, source_img_dir, source_mask_dir, dest_img_dir, dest_mask_dir, crop_normal_region,
+                     set_name=""):
+    """
+    处理文件列表并根据指令保存它们。
+    """
+
+    os.makedirs(dest_img_dir, exist_ok=True)
+    if dest_mask_dir:
+        os.makedirs(dest_mask_dir, exist_ok=True)
+
+    for filename_jpg in tqdm(file_list, desc=f"处理 {set_name}"):
+
+        # 确定源文件路径
+        base_name = os.path.splitext(filename_jpg)[0]
+        filename_png = base_name + '.png'
+
+        src_img_path = os.path.join(source_img_dir, filename_jpg)
+        src_mask_path = os.path.join(source_mask_dir, filename_png)
+
+        if not os.path.exists(src_img_path) or not os.path.exists(src_mask_path):
+            print(f"警告: 找不到 {filename_jpg} 或 {filename_png} 的文件对。跳过。")
+            continue
+
+        if crop_normal_region:
+            # --- 逻辑 1: 裁剪最大纯净区域 (用于 train/good 和 test/good) ---
+
+            # 找到最大纯净区域 (使用新的稳健算法)
+            rect = find_largest_pure_rectangle(src_mask_path)
+            if rect is None:
+                # rect 为 None 意味着找不到，或找到的区域太小 (<40%)
+                continue
+
+            x, y, w, h = rect
+
+            # 加载原图并裁剪
+            image = cv2.imread(src_img_path)
+            if image is None:
+                print(f"警告: 无法加载图片 {src_img_path}。跳过。")
+                continue
+
+            cropped_image = image[y:y + h, x:x + w]
+
+            # 定义目标路径
+            dest_img_path = os.path.join(dest_img_dir, base_name + f"_crop_{x}_{y}.png")
+            cv2.imwrite(dest_img_path, cropped_image)
+
+            # 如果是为 test/good 创建，我们需要一个全黑的 ground_truth 掩码
+            if dest_mask_dir:
+                # 创建一个全黑的掩码 (与裁剪的图片大小相同)
+                blank_mask = np.zeros((h, w), dtype=np.uint8)
+                dest_mask_path = os.path.join(dest_mask_dir, base_name + f"_crop_{x}_{y}.png")
+                cv2.imwrite(dest_mask_path, blank_mask)
+
+        else:
+            # --- 逻辑 2: 复制异常文件 (用于 test/crack) ---
+
+            # 复制原图
+            dest_img_path = os.path.join(dest_img_dir, filename_jpg)
+            shutil.copy(src_img_path, dest_img_path)
+
+            # 复制对应的真值掩码
+            if dest_mask_dir:
+                dest_mask_path = os.path.join(dest_mask_dir, filename_png)
+                shutil.copy(src_mask_path, dest_mask_path)
 
 
 def main():
-    print(f"--- 裁切方案 (采样率: {SAMPLE_RATIO * 100}%) ---")
-    print(f"正在创建MVTec格式目录: {BASE_OUTPUT_DIR}")
+    # 1. 定义源路径 (CRACK500FINAL)
+    source_img_dir = './CRACK500FINAL/JPEGImages'
+    source_mask_dir = './CRACK500FINAL/SegmentationClass'
 
-    # 清理旧的数据目录（如果存在），以防数据混淆
-    if os.path.exists(BASE_OUTPUT_DIR):
-        print(f"清理旧的数据集目录: {BASE_OUTPUT_DIR}")
-        shutil.rmtree(BASE_OUTPUT_DIR)
+    # 2. 定义目标 MVTec 格式的基路径
+    output_base = './data/RoadCrack_Crop/road_texture'
 
-    os.makedirs(TRAIN_GOOD_DIR, exist_ok=True)
-    os.makedirs(TEST_CRACK_DIR, exist_ok=True)
-    os.makedirs(GT_CRACK_DIR, exist_ok=True)
-    os.makedirs(TEST_GOOD_DIR, exist_ok=True)  # 创建一个空的 'test/good'
+    # 清理旧目录
+    if os.path.exists(output_base):
+        print(f"正在清理旧目录: {output_base}")
+        shutil.rmtree(output_base)
+    print("创建新目录结构...")
 
-    all_image_paths = sorted(glob(os.path.join(SOURCE_IMAGE_DIR, '*.jpg')))
-    if not all_image_paths:
-        print(f"错误: 在 {SOURCE_IMAGE_DIR} 中未找到 .jpg 图像。")
-        print(f"请确保您的 '{SOURCE_ROOT}' 文件夹与此脚本位于同一目录。")
-        sys.exit(1)
+    # 3. 定义目标路径
+    dest_train_good_img = os.path.join(output_base, 'train', 'good')
 
-    # --- !!! 新增：采样逻辑 !!! ---
-    if SAMPLE_RATIO < 1.0:
-        print(f"--- 采样模式: 仅使用 {SAMPLE_RATIO * 100:.0f}% 的图像进行小规模测试 ---")
-        num_to_sample = int(len(all_image_paths) * SAMPLE_RATIO)
-        if num_to_sample == 0 and len(all_image_paths) > 0:  # 确保至少有1张
-            num_to_sample = 1
-        # 使用 random.sample 进行随机采样
-        image_paths = random.sample(all_image_paths, num_to_sample)
-        print(f"将从 {len(all_image_paths)} 张图像中随机采样 {len(image_paths)} 张进行处理。")
-    else:
-        image_paths = all_image_paths  # 使用所有图像
-        print(f"将处理全部 {len(image_paths)} 张图像。")
-    # --- 结束新增 ---
+    dest_test_good_img = os.path.join(output_base, 'test', 'good')
+    dest_test_crack_img = os.path.join(output_base, 'test', 'crack')
 
-    print(f"开始处理 {len(image_paths)} 张图像...")
+    dest_gt_good_mask = os.path.join(output_base, 'ground_truth', 'good')
+    dest_gt_crack_mask = os.path.join(output_base, 'ground_truth', 'crack')
 
-    train_count = 0
-    test_count = 0
-    skipped_count = 0
+    # 4. 收集并拆分文件 (10%/10%/10% 非重叠逻辑)
+    try:
+        all_files = [f for f in os.listdir(source_img_dir) if f.endswith('.jpg')]
+        random.shuffle(all_files)
+    except FileNotFoundError:
+        print(f"错误: 找不到源目录 {source_img_dir}。请检查路径。")
+        return
 
-    for img_path in tqdm(image_paths, desc="处理图像"):
-        base_name = os.path.basename(img_path)
-        name_without_ext = os.path.splitext(base_name)[0]
-        mask_path = os.path.join(SOURCE_MASK_DIR, name_without_ext + '.png')
+    total_count = len(all_files)
+    if total_count == 0:
+        print(f"错误: 在 {source_img_dir} 中找不到 .jpg 文件。")
+        return
 
-        if not os.path.exists(mask_path):
-            continue
+    # 按照 10% / 10% / 10% 拆分
+    train_count = int(total_count * 0.1)
+    test_crack_count = int(total_count * 0.1)
+    test_good_count = int(total_count * 0.1)
 
-        try:
-            image = cv2.imread(img_path)
-            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    if total_count < 3 or train_count == 0 or test_crack_count == 0 or test_good_count == 0:
+        print(f"错误: 数据集太小 (总共 {total_count} 张图)。无法按 10% 拆分。")
+        print(f"至少需要约 30 张图才能分别为 train/test-crack/test-good 分配至少1张图。")
+        return
 
-            if image is None or mask is None:
-                continue
+    # 确保三组不重叠
+    train_files = all_files[0: train_count]
 
-            _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
-            img_h, img_w = image.shape[:2]
-            original_total_area = img_h * img_w
+    test_crack_files = all_files[train_count: train_count + test_crack_count]
 
-            # 1. 查找并裁切最大的纯净矩形 (用于 train/good)
-            pure_crop = find_largest_pure_rectangle(image, mask)
+    test_good_files = all_files[train_count + test_crack_count: train_count + test_crack_count + test_good_count]
 
-            if pure_crop is not None:
-                crop_h, crop_w = pure_crop.shape[:2]
-                crop_area = crop_h * crop_w
+    print(f"数据集拆分完毕:")
+    print(f" - 总文件数: {total_count}")
+    print(f" - train/good 来源文件数: {len(train_files)}")
+    print(f" - test/crack 来源文件数: {len(test_crack_files)}")
+    print(f" - test/good 来源文件数: {len(test_good_files)}")
+    print(f" - 未使用文件数: {total_count - len(train_files) - len(test_crack_files) - len(test_good_files)}")
+    print("-" * 30)
 
-                if (crop_area / original_total_area) >= MIN_NORMAL_AREA_RATIO:
-                    save_path = os.path.join(TRAIN_GOOD_DIR, f"{name_without_ext}_crop.jpg")
-                    cv2.imwrite(save_path, pure_crop)
-                    train_count += 1
-                else:
-                    skipped_count += 1
-            else:
-                skipped_count += 1
+    # 5. 处理文件
 
-            # 2. 复制原始图像和掩码到 test/crack 和 ground_truth/crack
-            shutil.copy(img_path, os.path.join(TEST_CRACK_DIR, base_name))
-            shutil.copy(mask_path, os.path.join(GT_CRACK_DIR, name_without_ext + '.png'))
-            test_count += 1
+    # --- A. 创建训练集 (train/good) ---
+    process_and_save(train_files, source_img_dir, source_mask_dir,
+                     dest_train_good_img,
+                     None,  # train/good 不需要 ground_truth
+                     crop_normal_region=True,
+                     set_name="train/good")
 
-        except Exception as e:
-            print(f"处理 {base_name} 时发生严重错误: {e}")
+    # --- B. 创建测试集 (test/crack) ---
+    process_and_save(test_crack_files, source_img_dir, source_mask_dir,
+                     dest_test_crack_img,
+                     dest_gt_crack_mask,
+                     crop_normal_region=False,
+                     set_name="test/crack")
 
-    print("\n--- 处理完成 ---")
-    print(f"总共处理了 {len(image_paths)} 张采样的图像。")
-    print(f"生成了 {train_count} 张'大于40%面积'的纯净裁切样本 (在 {TRAIN_GOOD_DIR})")
-    print(f"有 {skipped_count} 张图像因裁切后面积不足40%或形状不佳而被跳过。")
-    print(f"复制了 {test_count} 张图像和掩码到 'test/crack' 目录。")
-    print(f"您的小规模数据集已准备就绪: {BASE_OUTPUT_DIR}")
+    # --- C. 创建测试集 (test/good) ---
+    process_and_save(test_good_files, source_img_dir, source_mask_dir,
+                     dest_test_good_img,
+                     dest_gt_good_mask,
+                     crop_normal_region=True,
+                     set_name="test/good")
+
+    print("-" * 30)
+    print("数据准备完成！")
 
 
 if __name__ == "__main__":
-    if not os.path.exists(SOURCE_ROOT):
-        print(f"错误: 原始数据目录 '{SOURCE_ROOT}' 未找到。")
-        print("请确保 CRACK500FINAL 文件夹与此脚本在同一目录中。")
-        sys.exit(1)
     main()
