@@ -7,7 +7,9 @@ import torchvision
 import threading
 import torchvision.transforms as transforms
 from tabulate import tabulate
-from sklearn.metrics import roc_auc_score
+# --- 修复 4 (START): 导入 average_precision_score ---
+from sklearn.metrics import roc_auc_score, average_precision_score
+# --- 修复 4 (END) ---
 from tqdm import tqdm
 import math
 from PIL import Image
@@ -55,15 +57,43 @@ def cal_score(obj):
     pr_px = np.array(pr_px)
     pr_sp = np.array(pr_sp)
 
-    auroc_sp = roc_auc_score(gt_sp, pr_sp)
+    # -----------------------------------------------------------------
+    # --- 方案二修复 (START): 捕获样本级 AUROC 计算错误 ---
+    # -----------------------------------------------------------------
+    try:
+        auroc_sp = roc_auc_score(gt_sp, pr_sp)
+    except ValueError as e:
+        # logger 是在主线程中定义的，在线程中访问它
+        logger.warning(f"无法计算 {obj} 的 sample-level AUROC: {e}")
+        auroc_sp = np.nan  # 将无法计算的分数记为 nan
+    # -----------------------------------------------------------------
+    # --- 方案二修复 (END) ---
+    # -----------------------------------------------------------------
+
+    # 像素级 AUROC
     auroc_px = roc_auc_score(gt_px.ravel(), pr_px.ravel())
+
+    # --- 修复 4 (START): 新增 AUPRC-PX 计算 ---
+    # 鉴于像素不平衡，AUPRC 是一个很好的补充指标
+    try:
+        auprc_px = average_precision_score(gt_px.ravel(), pr_px.ravel())
+    except ValueError as e:
+        logger.warning(f"无法计算 {obj} 的 pixel-level AUPRC: {e}")
+        auprc_px = np.nan
+    # --- 修复 4 (END) ---
 
     table.append(str(np.round(auroc_sp * 100, decimals=1)))
     table.append(str(np.round(auroc_px * 100, decimals=1)))
+    # --- 修复 4 (START): 添加 AUPRC-PX 到表格 ---
+    table.append(str(np.round(auprc_px * 100, decimals=1)))
+    # --- 修复 4 (END) ---
 
     table_ls.append(table)
-    auroc_sp_ls.append(auroc_sp)
+    auroc_sp_ls.append(auroc_sp)  # 添加计算出的值 (或 nan)
     auroc_px_ls.append(auroc_px)
+    # --- 修复 4 (START): 添加 AUPRC-PX 到列表 ---
+    auprc_px_ls.append(auprc_px)
+    # --- 修复 4 (END) ---
 
 
 if __name__ == "__main__":
@@ -396,6 +426,9 @@ if __name__ == "__main__":
     table_ls = []
     auroc_sp_ls = []
     auroc_px_ls = []
+    # --- 修复 4 (START): 初始化 AUPRC-PX 列表 ---
+    auprc_px_ls = []
+    # --- 修复 4 (END) ---
 
     threads = [None] * 20
     idx = 0
@@ -408,19 +441,32 @@ if __name__ == "__main__":
         threads[i].join()
 
     # logger
+    # -----------------------------------------------------------------
+    # --- 方案二修复 (START): 使用 np.nanmean 忽略 nan 值计算均值 ---
+    # -----------------------------------------------------------------
     table_ls.append(
         [
             "mean",
-            str(np.round(np.mean(auroc_sp_ls) * 100, decimals=1)),
-            str(np.round(np.mean(auroc_px_ls) * 100, decimals=1)),
+            str(np.round(np.nanmean(auroc_sp_ls) * 100, decimals=1)),  # 使用 nanmean
+            str(np.round(np.nanmean(auroc_px_ls) * 100, decimals=1)),  # 使用 nanmean
+            # --- 修复 4 (START): 添加 AUPRC-PX 均值 ---
+            str(np.round(np.nanmean(auprc_px_ls) * 100, decimals=1)),  # 使用 nanmean
+            # --- 修复 4 (END) ---
         ]
     )
+    # -----------------------------------------------------------------
+    # --- 方案二修复 (END) ---
+    # -----------------------------------------------------------------
+
     results = tabulate(
         table_ls,
         headers=[
             "objects",
             "auroc_sp",
             "auroc_px",
+            # --- 修复 4 (START): 添加 AUPRC-PX 标题 ---
+            "auprc_px",
+            # --- 修复 4 (END) ---
         ],
         tablefmt="pipe",
     )
