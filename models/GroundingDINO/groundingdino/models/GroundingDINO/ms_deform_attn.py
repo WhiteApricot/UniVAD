@@ -29,6 +29,7 @@ try:
     from groundingdino import _C
 except:
     warnings.warn("Failed to load custom C++ ops. Running on CPU mode Only!")
+    _C = None
 
 
 # helpers
@@ -41,15 +42,17 @@ def _is_power_of_2(n):
 class MultiScaleDeformableAttnFunction(Function):
     @staticmethod
     def forward(
-        ctx,
-        value,
-        value_spatial_shapes,
-        value_level_start_index,
-        sampling_locations,
-        attention_weights,
-        im2col_step,
+            ctx,
+            value,
+            value_spatial_shapes,
+            value_level_start_index,
+            sampling_locations,
+            attention_weights,
+            im2col_step,
     ):
         ctx.im2col_step = im2col_step
+        # C++ aot/jit load (A)
+        # It is normal that this line raises Attribute Error if C++ extension is not loaded.
         output = _C.ms_deform_attn_forward(
             value,
             value_spatial_shapes,
@@ -91,12 +94,11 @@ class MultiScaleDeformableAttnFunction(Function):
 
 
 def multi_scale_deformable_attn_pytorch(
-    value: torch.Tensor,
-    value_spatial_shapes: torch.Tensor,
-    sampling_locations: torch.Tensor,
-    attention_weights: torch.Tensor,
+        value: torch.Tensor,
+        value_spatial_shapes: torch.Tensor,
+        sampling_locations: torch.Tensor,
+        attention_weights: torch.Tensor,
 ) -> torch.Tensor:
-
     bs, _, num_heads, embed_dims = value.shape
     _, num_queries, num_heads, num_levels, num_points, _ = sampling_locations.shape
     value_list = value.split([H_ * W_ for H_, W_ in value_spatial_shapes], dim=1)
@@ -152,13 +154,13 @@ class MultiScaleDeformableAttention(nn.Module):
     """
 
     def __init__(
-        self,
-        embed_dim: int = 256,
-        num_heads: int = 8,
-        num_levels: int = 4,
-        num_points: int = 4,
-        img2col_step: int = 64,
-        batch_first: bool = False,
+            self,
+            embed_dim: int = 256,
+            num_heads: int = 8,
+            num_levels: int = 4,
+            num_points: int = 4,
+            img2col_step: int = 64,
+            batch_first: bool = False,
     ):
         super().__init__()
         if embed_dim % num_heads != 0:
@@ -200,7 +202,7 @@ class MultiScaleDeformableAttention(nn.Module):
         """
         constant_(self.sampling_offsets.weight.data, 0.0)
         thetas = torch.arange(self.num_heads, dtype=torch.float32) * (
-            2.0 * math.pi / self.num_heads
+                2.0 * math.pi / self.num_heads
         )
         grid_init = torch.stack([thetas.cos(), thetas.sin()], -1)
         grid_init = (
@@ -230,16 +232,16 @@ class MultiScaleDeformableAttention(nn.Module):
         self.attention_weights.bias.requires_grad = False
 
     def forward(
-        self,
-        query: torch.Tensor,
-        key: Optional[torch.Tensor] = None,
-        value: Optional[torch.Tensor] = None,
-        query_pos: Optional[torch.Tensor] = None,
-        key_padding_mask: Optional[torch.Tensor] = None,
-        reference_points: Optional[torch.Tensor] = None,
-        spatial_shapes: Optional[torch.Tensor] = None,
-        level_start_index: Optional[torch.Tensor] = None,
-        **kwargs
+            self,
+            query: torch.Tensor,
+            key: Optional[torch.Tensor] = None,
+            value: Optional[torch.Tensor] = None,
+            query_pos: Optional[torch.Tensor] = None,
+            key_padding_mask: Optional[torch.Tensor] = None,
+            reference_points: Optional[torch.Tensor] = None,
+            spatial_shapes: Optional[torch.Tensor] = None,
+            level_start_index: Optional[torch.Tensor] = None,
+            **kwargs
     ) -> torch.Tensor:
 
         """Forward Function of MultiScaleDeformableAttention
@@ -309,16 +311,16 @@ class MultiScaleDeformableAttention(nn.Module):
         if reference_points.shape[-1] == 2:
             offset_normalizer = torch.stack([spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
             sampling_locations = (
-                reference_points[:, :, None, :, None, :]
-                + sampling_offsets / offset_normalizer[None, None, None, :, None, :]
+                    reference_points[:, :, None, :, None, :]
+                    + sampling_offsets / offset_normalizer[None, None, None, :, None, :]
             )
         elif reference_points.shape[-1] == 4:
             sampling_locations = (
-                reference_points[:, :, None, :, None, :2]
-                + sampling_offsets
-                / self.num_points
-                * reference_points[:, :, None, :, None, 2:]
-                * 0.5
+                    reference_points[:, :, None, :, None, :2]
+                    + sampling_offsets
+                    / self.num_points
+                    * reference_points[:, :, None, :, None, 2:]
+                    * 0.5
             )
         else:
             raise ValueError(
@@ -326,8 +328,21 @@ class MultiScaleDeformableAttention(nn.Module):
                     reference_points.shape[-1]
                 )
             )
-    
-        if torch.cuda.is_available() and value.is_cuda:
+
+        # ---
+        # --- BUG FIX START ---
+        # ---
+        # 原始的 (Buggy) 代码是:
+        # if torch.cuda.is_available() and value.is_cuda:
+        #
+        # 这会错误地在 C++ 模块（_C）编译失败（_C is None）
+        # 但 CUDA 仍然可用时，尝试调用 C++ 函数。
+        #
+        # 修复后的代码检查 _C 是否成功加载
+        if _C is not None and torch.cuda.is_available() and value.is_cuda:
+            # ---
+            # --- BUG FIX END ---
+            # ---
             halffloat = False
             if value.dtype == torch.float16:
                 halffloat = True
@@ -347,6 +362,7 @@ class MultiScaleDeformableAttention(nn.Module):
             if halffloat:
                 output = output.half()
         else:
+            # --- 纯 Python 备用路径 (现在将为 CPU 或 _C=None 的情况正确执行) ---
             output = multi_scale_deformable_attn_pytorch(
                 value, spatial_shapes, sampling_locations, attention_weights
             )

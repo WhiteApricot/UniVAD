@@ -1,0 +1,14 @@
+25-11-16 19:17:46.635 - INFO: image_size: 224
+25-11-16 19:17:46.636 - INFO: k_shot: 4
+25-11-16 19:17:46.636 - INFO: dataset: RoadCrack_Crop
+25-11-16 19:17:46.636 - INFO: data_path: ./data/mvtec
+25-11-16 19:17:46.637 - INFO: save_path: results/RoadCrack_Crop/road_texture/4shot_small_test
+25-11-16 19:17:46.637 - INFO: round: 3
+25-11-16 19:17:46.637 - INFO: class_name: road_texture
+25-11-16 19:17:46.637 - INFO: device: cuda
+25-11-16 19:18:47.524 - INFO: 加载自定义数据集: ./data/RoadCrack_Crop
+25-11-16 19:20:01.905 - INFO: 为 road texture 加载 4 个参考样本...
+25-11-16 19:37:45.303 - INFO: 
+| objects   |   auroc_sp |   auroc_px |
+|:----------|-----------:|-----------:|
+| mean      |        nan |        nan |

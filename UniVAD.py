@@ -80,6 +80,7 @@ def see_image(data, heatmap, savepath, heatmap_intra):
         heat = np.round(heat * 128).astype(np.uint8)
         cv2.imwrite(f"{savepath}/heatresult{i}.jpg", heat)
 
+
 class UniVAD(nn.Module):
 
     def __init__(self, image_size=224) -> None:
@@ -150,7 +151,6 @@ class UniVAD(nn.Module):
             ]
         )
 
-
         self.config = {}
         self.config["com_config"] = {}
         self.config["com_config"]["transform_clip"] = transform_ce_clip
@@ -168,7 +168,7 @@ class UniVAD(nn.Module):
             )
 
     def forward(
-        self, batch: torch.Tensor, image_path, image_pil=None
+            self, batch: torch.Tensor, image_path, image_pil=None
     ) -> dict[str, torch.Tensor]:
 
         clip_transformed_image = self.transform_clip(batch)
@@ -188,10 +188,10 @@ class UniVAD(nn.Module):
             text_features = self.text_prompts["object"]
 
         global_score = (
-            1
-            - (image_features @ self.normal_image_features.transpose(-2, -1))
-            .max()
-            .item()
+                1
+                - (image_features @ self.normal_image_features.transpose(-2, -1))
+                .max()
+                .item()
         )
 
         sims = []
@@ -250,8 +250,8 @@ class UniVAD(nn.Module):
             )
             anomaly_map_vl = torch.softmax(anomaly_map_vl, dim=1)
             anomaly_map_vl = (
-                anomaly_map_vl[:, 1, :, :] - anomaly_map_vl[:, 0, :, :] + 1
-            ) / 2
+                                     anomaly_map_vl[:, 1, :, :] - anomaly_map_vl[:, 0, :, :] + 1
+                             ) / 2
             anomaly_map_vls.append(anomaly_map_vl)
         anomaly_map_vls = torch.mean(
             torch.stack(anomaly_map_vls, dim=0), dim=0
@@ -260,8 +260,8 @@ class UniVAD(nn.Module):
         if self.gate == object_type.TEXTURE:
 
             anomaly_map_ret_all = (
-                anomaly_map_ret + anomaly_map_ret_dino + anomaly_map_vls
-            ) / 3
+                                          anomaly_map_ret + anomaly_map_ret_dino + anomaly_map_vls
+                                  ) / 3
 
             if "HIS" in image_path:
                 return {
@@ -274,13 +274,31 @@ class UniVAD(nn.Module):
                     "pred_mask": anomaly_map_ret_all,
                 }
 
-        query_sam_mask_path = (
-            ("./masks/" + image_path.split('/data/')[-1])
-            .replace(".png", "/grounding_mask.png")
-            .replace(".JPG", "/grounding_mask.png")
-            .replace(".jpeg", "/grounding_mask.png")
-        )
-        # print(query_sam_mask_path)
+        # -----------------------------------------------------------------
+        # --- 最终修复 (START): 修复测试时的掩码路径 (Bug 2) ---
+        # -----------------------------------------------------------------
+        # 'image_path' 是 'test_univad.py' 传入的,
+        # e.g., G:\PyTorchLearning\AbnormalDetection\UniVAD\data\RoadCrack_Crop\road_texture\test\crack\2016...jpg
+        # (在 'mvtec.py' 中, 它被 'os.path.join(self.root, img_path)' 拼装成了绝对路径)
+
+        # 我们需要将其转换为:
+        # G:\PyTorchLearning\AbnormalDetection\UniVAD\masks\RoadCrack_Crop\road_texture\test\crack\2016...\grounding_mask.png
+
+        # 1. 规范化路径 (将 G:\... 替换为 ./)
+        # (这假设脚本是从 G:\PyTorchLearning\AbnormalDetection\UniVAD 运行的)
+        relative_image_path = os.path.relpath(image_path)
+
+        # 2. 将 'data' 替换为 'masks'
+        #    (使用 os.path.normpath 确保跨平台路径正确)
+        path_with_masks = relative_image_path.replace(os.path.normpath("data"), os.path.normpath("masks"), 1)
+
+        # 3. 移除 .jpg/.png/.JPG/.jpeg 扩展名, 添加子文件夹和 'grounding_mask.png'
+        filename_without_ext = os.path.splitext(path_with_masks)[0]
+        query_sam_mask_path = os.path.join(filename_without_ext, "grounding_mask.png")
+        # -----------------------------------------------------------------
+        # --- 最终修复 (END) ---
+        # -----------------------------------------------------------------
+
         query_tmp_mask = np.array(
             Image.open(query_sam_mask_path).resize((self.image_size, self.image_size))
         )
@@ -332,7 +350,7 @@ class UniVAD(nn.Module):
                 ).to(self.device)
                 dino_patch_tokens_reshaped = dino_patch_tokens.view(-1, 1, 1536)[
                     thresh > 0
-                ]
+                    ]
                 dino_normal_tokens_reshaped = self.normal_dino_part_patch_features[
                     0
                 ].reshape(1, -1, 1536)
@@ -362,10 +380,10 @@ class UniVAD(nn.Module):
             )
 
             anomaly_map_ret_all = (
-                (anomaly_map_ret + anomaly_map_ret_dino) / 2
-                + (anomaly_map_ret_part + anomaly_map_ret_dino_part) / 2
-                + anomaly_map_vls
-            ) / 3
+                                          (anomaly_map_ret + anomaly_map_ret_dino) / 2
+                                          + (anomaly_map_ret_part + anomaly_map_ret_dino_part) / 2
+                                          + anomaly_map_vls
+                                  ) / 3
 
         if self.gate == object_type.MULTI:
 
@@ -466,7 +484,7 @@ class UniVAD(nn.Module):
 
                 dino_patch_tokens_reshaped = dino_patch_tokens.view(-1, 1, 1536)[
                     thresh > 0
-                ]
+                    ]
                 dino_normal_tokens_reshaped = self.normal_dino_part_patch_features[
                     query_mask_idxs[j]
                 ].reshape(1, -1, 1536)
@@ -589,10 +607,10 @@ class UniVAD(nn.Module):
                 anomaly_map_dist[thresh_ori > 0] += dist
 
             anomaly_map_ret_all = (
-                (anomaly_map_ret + anomaly_map_ret_dino) / 2
-                + (anomaly_map_ret_part + anomaly_map_ret_dino_part) / 2
-                + anomaly_map_vls
-            ) / 3 + anomaly_map_dist / 2
+                                          (anomaly_map_ret + anomaly_map_ret_dino) / 2
+                                          + (anomaly_map_ret_part + anomaly_map_ret_dino_part) / 2
+                                          + anomaly_map_vls
+                                  ) / 3 + anomaly_map_dist / 2
 
         return {
             "pred_score": torch.tensor(anomaly_map_ret_all.max().item() + global_score),
@@ -644,12 +662,32 @@ class UniVAD(nn.Module):
         color_tensor = color_tensor[:, :, None, None]
         self.color_tensor = color_tensor.repeat(1, 1, self.image_size, self.image_size)
 
-        grounded_sam_mask_paths = [
-            ("./masks/" + image_path.split('/data/')[-1])
-            .replace(".png", "/grounding_mask.png")
-            .replace(".JPG", "/grounding_mask.png")
-            for image_path in image_paths
-        ]
+        # -----------------------------------------------------------------
+        # --- 最终修复 (START): 修复 FileNotFoundError ---
+        # -----------------------------------------------------------------
+        grounded_sam_mask_paths = []
+        for image_path in image_paths:
+            # 'image_path' 是 'test_univad.py' 传入的,
+            # e.g., ./data/RoadCrack_Crop/road_texture/train/good/2016..._crop.jpg
+
+            # 1. 规范化路径 (将 G:\... 替换为 ./)
+            relative_image_path = os.path.relpath(image_path)
+
+            # 2. 将 'data' 替换为 'masks'
+            #    (使用 os.path.normpath 确保跨平台路径正确)
+            path_with_masks = relative_image_path.replace(os.path.normpath("data"), os.path.normpath("masks"), 1)
+
+            # 3. 移除 .jpg/.png/.JPG/.jpeg 扩展名
+            filename_without_ext = os.path.splitext(path_with_masks)[0]
+
+            # 4. 构造成您描述的路径: .../IMAGE_NAME/grounding_mask.png
+            mask_path = os.path.join(filename_without_ext, "grounding_mask.png")
+
+            grounded_sam_mask_paths.append(mask_path)
+        # -----------------------------------------------------------------
+        # --- 最终修复 (END) ---
+        # -----------------------------------------------------------------
+
         grounded_sam_masks = [
             split_masks_from_one_mask_torch(
                 torch.tensor(
@@ -661,7 +699,8 @@ class UniVAD(nn.Module):
 
         if len(grounded_sam_masks[0]) > 0:
             H, W = grounded_sam_masks[0][0].shape
-            object_ratio = (torch.sum(sorted(grounded_sam_masks[0], key=lambda x:torch.sum(x), reverse=True)[0]) / 255) / (H * W)
+            object_ratio = (torch.sum(
+                sorted(grounded_sam_masks[0], key=lambda x: torch.sum(x), reverse=True)[0]) / 255) / (H * W)
         else:
             object_ratio = 1
 
@@ -672,7 +711,6 @@ class UniVAD(nn.Module):
         else:
             self.gate = object_type.MULTI
 
-
         with torch.no_grad():
             self.normal_image_features, self.normal_patch_tokens = (
                 self.clip_model.encode_image(
@@ -681,7 +719,7 @@ class UniVAD(nn.Module):
             )
             self.normal_image_features = self.normal_image_features[:, 0, :]
             self.normal_image_features = (
-                self.normal_image_features / self.normal_image_features.norm()
+                    self.normal_image_features / self.normal_image_features.norm()
             )
 
             self.normal_patch_tokens = self.decoder(self.normal_patch_tokens)
@@ -927,7 +965,6 @@ class UniVAD(nn.Module):
                 self.normal_component_feats["dino_image"]
             )
 
-
             self.normal_component_feats["geo"] = torch.cat(
                 [
                     self.normal_component_feats["area"],
@@ -941,6 +978,7 @@ class UniVAD(nn.Module):
 def calculate_iou_torch(mask1, mask2):
     intersection = torch.sum((mask1 & mask2).float())
     return intersection
+
 
 def assign_fine_to_coarse_torch(coarse_masks, fine_masks):
     M, H, W = coarse_masks.shape

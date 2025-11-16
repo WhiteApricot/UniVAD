@@ -206,6 +206,24 @@ if __name__ == "__main__":
             aug_rate=-1,
             mode="test",
         )
+    # -----------------------------------------------------------------
+    # --- 修复 1 (START): 兼容 RoadCrack_Crop (修复 NotImplementedError) ---
+    # -----------------------------------------------------------------
+    elif dataset_name == "RoadCrack_Crop":
+        # 我们重用 MVTecDataset，因为它符合 MVTec 格式
+        # 关键: 确保 'root' 指向您的数据集路径
+        dataset_dir = f'./data/{dataset_name}'  # 即 './data/RoadCrack_Crop'
+        logger.info(f"加载自定义数据集: {dataset_dir}")
+        test_data = MVTecDataset(
+            root=dataset_dir,
+            transform=transform,
+            target_transform=transform,
+            aug_rate=-1,
+            mode="test",
+        )
+    # -----------------------------------------------------------------
+    # --- 修复 1 (END) ---
+    # -----------------------------------------------------------------
     else:
         raise NotImplementedError("Dataset not supported")
 
@@ -234,11 +252,20 @@ if __name__ == "__main__":
         image_pil = items["img_pil"]
         image_path = items["img_path"][0]
 
+        # -----------------------------------------------------------------
+        # --- 修复 3 (START): 修复 NameError ---
+        # -----------------------------------------------------------------
+        # 必须先从 'items' 中定义 'cls_name'
+        cls_name = items["cls_name"][0]
+        # -----------------------------------------------------------------
+        # --- 修复 3 (END) ---
+        # -----------------------------------------------------------------
+
         if args.class_name != "None":
-            if args.class_name not in image_path:
+            # 检查现在可以安全运行
+            if args.class_name.replace("_", " ") != cls_name:
                 continue
 
-        cls_name = items["cls_name"][0]
         results["cls_names"].append(cls_name)
         gt_mask = items["img_mask"]
         gt_mask[gt_mask > 0.5], gt_mask[gt_mask <= 0.5] = 1, 0
@@ -298,12 +325,44 @@ if __name__ == "__main__":
                 "resc",
             ]:
                 dir = (
-                    "./data/"
-                    + cls_name.replace(" ", "_")
-                    + "/train/good"
+                        "./data/"
+                        + cls_name.replace(" ", "_")
+                        + "/train/good"
                 )
                 files = sorted(os.listdir(dir))[:k_shot]
                 normal_image_paths = [os.path.join(dir, file) for file in files]
+            # -----------------------------------------------------------------
+            # --- 修复 2 (START): 兼容 RoadCrack_Crop (修复 FileNotFoundError) ---
+            # -----------------------------------------------------------------
+            elif dataset_name == "RoadCrack_Crop":
+                # 关键修复：确保路径指向 "./data/..." 而不是 "./masks/..."
+                dir = (
+                        f"./data/{dataset_name}/"  # <-- 修复了这里的路径
+                        + cls_name.replace(" ", "_")
+                        + "/train/good"
+                )
+
+                files = os.listdir(dir)
+                # 修复：确保在 k_shot 大于可用文件数时不会崩溃
+                if len(files) < k_shot:
+                    logger.warning(f"警告: 期望 {k_shot} 个参考样本，但只找到 {len(files)} 个。")
+                    k_shot_actual = len(files)
+                else:
+                    k_shot_actual = k_shot
+
+                # 确保 k_shot_actual > 0
+                if k_shot_actual == 0:
+                    logger.error(f"错误: 在 {dir} 中找不到任何参考样本。")
+                    # 在这种情况下我们无法继续
+                    raise FileNotFoundError(f"No reference images found in {dir}")
+
+                selected_files = np.random.choice(files, k_shot_actual, replace=False)
+
+                normal_image_paths = [os.path.join(dir, file) for file in selected_files]
+                logger.info(f"为 {cls_name} 加载 {len(normal_image_paths)} 个参考样本...")
+            # -----------------------------------------------------------------
+            # --- 修复 2 (END) ---
+            # -----------------------------------------------------------------
 
             # normal_image_path = normal_image_paths[:k_shot]
             normal_images = torch.cat(

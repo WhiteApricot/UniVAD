@@ -8,6 +8,10 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+models/
+CRACK500FINAL/
+data/RoadCrack_Crop
+masks/RoadCrack_Crop
 build/
 develop-eggs/
 dist/
