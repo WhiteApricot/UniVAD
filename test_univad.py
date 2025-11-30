@@ -14,6 +14,7 @@ from tqdm import tqdm
 import math
 from PIL import Image
 from prefetch_generator import BackgroundGenerator
+import matplotlib.pyplot as plt  # <--- 新增：导入 matplotlib 用于绘图
 from UniVAD import UniVAD
 
 from datasets.mvtec import MVTecDataset
@@ -126,6 +127,7 @@ if __name__ == "__main__":
     k_shot = args.k_shot
 
     image_size = args.image_size
+    # 注意：这里的 save_path 仅用于日志，后面的可视化路径是独立构建的
     save_path = args.save_path + "/" + dataset_name + "/"
     if not os.path.exists(save_path):
         os.makedirs(save_path)
@@ -421,6 +423,52 @@ if __name__ == "__main__":
             results["anomaly_maps"].append(anomaly_map.detach().cpu().numpy())
             overall_anomaly_score = anomaly_score.item()
             results["pr_sp"].append(overall_anomaly_score)
+
+            # =================================================================
+            # --- 新增功能: 逐像素可视化保存 (支持 k_shot 动态命名) ---
+            # =================================================================
+            # 1. 动态构建保存路径
+            # 格式: results/[Dataset]/[Class]/[K]shot_small_test/[Dataset]/
+            vis_dir_name = f"{k_shot}shot_small_test"
+            vis_save_path = os.path.join(
+                args.save_path,  # results/
+                dataset_name,  # RoadCrack_Crop
+                cls_name.replace(" ", "_"),  # road_texture
+                vis_dir_name,  # 4shot_small_test
+                dataset_name  # RoadCrack_Crop (保留原有目录结构习惯)
+            )
+
+            if not os.path.exists(vis_save_path):
+                os.makedirs(vis_save_path, exist_ok=True)
+
+            # 2. 准备数据
+            img_vis = image[0].permute(1, 2, 0).cpu().numpy()
+            gt_vis = gt_mask[0].squeeze().cpu().numpy()
+            score_vis = anomaly_map.detach().cpu().numpy().squeeze()
+
+            # 3. 绘图 (三联图)
+            fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+
+            axes[0].imshow(img_vis)
+            axes[0].set_title("Original Image")
+            axes[0].axis("off")
+
+            axes[1].imshow(gt_vis, cmap="gray")
+            axes[1].set_title("Ground Truth")
+            axes[1].axis("off")
+
+            im_score = axes[2].imshow(score_vis, cmap="jet")
+            axes[2].set_title("Anomaly Prediction")
+            axes[2].axis("off")
+            plt.colorbar(im_score, ax=axes[2], fraction=0.046, pad=0.04)
+
+            # 4. 保存
+            file_name = os.path.basename(image_path)
+            # 替换扩展名以防混淆，或者直接使用原名
+            save_full_path = os.path.join(vis_save_path, file_name)
+            plt.savefig(save_full_path, bbox_inches='tight', pad_inches=0.1)
+            plt.close(fig)
+            # =================================================================
 
     # metrics
     table_ls = []

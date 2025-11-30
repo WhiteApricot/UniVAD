@@ -9,6 +9,7 @@ __pycache__/
 # Distribution / packaging
 .Python
 models/
+results/
 backup/
 CRACK500FINAL/
 data/RoadCrack_Crop

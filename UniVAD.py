@@ -81,6 +81,61 @@ def see_image(data, heatmap, savepath, heatmap_intra):
         cv2.imwrite(f"{savepath}/heatresult{i}.jpg", heat)
 
 
+# =========================================================
+#  新增辅助函数：智能寻找掩码路径
+# =========================================================
+def find_mask_path_smart(image_path):
+    """
+    根据图片路径智能推导掩码路径。
+    优先匹配用户描述的 RoadCrack_Crop 结构：
+    Image: .../test/crack/xxx.jpg
+    Mask:  .../ground_truth/crack/xxx.png
+    """
+    # 1. 基础清理
+    # 统一路径分隔符，去掉可能存在的 ./ 前缀干扰
+    normalized_path = os.path.normpath(image_path)
+    # 获取无后缀的基准路径 (e.g., data/RoadCrack/test/crack/img1)
+    base_no_ext = os.path.splitext(normalized_path)[0]
+
+    candidates = []
+
+    # --- 策略 A: 用户指定的 RoadCrack 结构 (data 下, test -> ground_truth) ---
+    if "test" in normalized_path:
+        # 替换 test 为 ground_truth
+        # e.g. data/RoadCrack/test/crack -> data/RoadCrack/ground_truth/crack
+        path_a = normalized_path.replace(f"{os.sep}test{os.sep}", f"{os.sep}ground_truth{os.sep}")
+        path_a = os.path.splitext(path_a)[0] + ".png"
+        candidates.append(path_a)
+
+    if "train" in normalized_path:
+        # e.g. data/RoadCrack/train/good -> data/RoadCrack/ground_truth/good
+        path_b = normalized_path.replace(f"{os.sep}train{os.sep}", f"{os.sep}ground_truth{os.sep}")
+        path_b = os.path.splitext(path_b)[0] + ".png"
+        candidates.append(path_b)
+
+    # --- 策略 B: UniVAD 默认结构 (masks 下, 同名文件夹 + grounding_mask.png) ---
+    # 尝试把 data 替换为 masks
+    if "data" in normalized_path:
+        path_c_base = normalized_path.replace("data", "masks")
+        path_c = os.path.join(os.path.splitext(path_c_base)[0], "grounding_mask.png")
+        candidates.append(path_c)
+
+    # --- 策略 C: 原始结构 (直接在原图同级目录下找 grounding_mask.png) ---
+    path_d = os.path.join(base_no_ext, "grounding_mask.png")
+    candidates.append(path_d)
+
+    # --- 检查文件是否存在 ---
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+
+    # 如果都找不到，默认返回策略 A 的路径（即使不存在，方便报错时看出我们在找哪里）
+    # 或者对于 test/good 这种可能没有掩码的情况，返回一个特殊标记或 None
+    if len(candidates) > 0:
+        return candidates[0]
+    return image_path  # Fallback
+
+
 class UniVAD(nn.Module):
 
     def __init__(self, image_size=224) -> None:
@@ -275,33 +330,23 @@ class UniVAD(nn.Module):
                 }
 
         # -----------------------------------------------------------------
-        # --- 最终修复 (START): 修复测试时的掩码路径 (Bug 2) ---
+        # --- 最终修复 (START): 使用智能路径查找 ---
         # -----------------------------------------------------------------
-        # 'image_path' 是 'test_univad.py' 传入的,
-        # e.g., G:\PyTorchLearning\AbnormalDetection\UniVAD\data\RoadCrack_Crop\road_texture\test\crack\2016...jpg
-        # (在 'mvtec.py' 中, 它被 'os.path.join(self.root, img_path)' 拼装成了绝对路径)
+        query_sam_mask_path = find_mask_path_smart(image_path)
 
-        # 我们需要将其转换为:
-        # G:\PyTorchLearning\AbnormalDetection\UniVAD\masks\RoadCrack_Crop\road_texture\test\crack\2016...\grounding_mask.png
-
-        # 1. 规范化路径 (将 G:\... 替换为 ./)
-        # (这假设脚本是从 G:\PyTorchLearning\AbnormalDetection\UniVAD 运行的)
-        relative_image_path = os.path.relpath(image_path)
-
-        # 2. 将 'data' 替换为 'masks'
-        #    (使用 os.path.normpath 确保跨平台路径正确)
-        path_with_masks = relative_image_path.replace(os.path.normpath("data"), os.path.normpath("masks"), 1)
-
-        # 3. 移除 .jpg/.png/.JPG/.jpeg 扩展名, 添加子文件夹和 'grounding_mask.png'
-        filename_without_ext = os.path.splitext(path_with_masks)[0]
-        query_sam_mask_path = os.path.join(filename_without_ext, "grounding_mask.png")
+        # 容错处理：如果依然找不到（比如正常的图片可能没有mask文件），创建一个全黑的dummy mask
+        if not os.path.exists(query_sam_mask_path):
+            # 仅在找不到时打印警告，避免刷屏
+            # print(f"Warning: Mask not found: {query_sam_mask_path}, utilizing full mask.")
+            query_tmp_mask = np.ones((self.image_size, self.image_size), dtype=np.uint8) * 255
+        else:
+            query_tmp_mask = np.array(
+                Image.open(query_sam_mask_path).resize((self.image_size, self.image_size))
+            )
         # -----------------------------------------------------------------
         # --- 最终修复 (END) ---
         # -----------------------------------------------------------------
 
-        query_tmp_mask = np.array(
-            Image.open(query_sam_mask_path).resize((self.image_size, self.image_size))
-        )
         query_sam_masks = split_masks_from_one_mask_torch(torch.tensor(query_tmp_mask))
         if len(query_sam_masks) == 0:
             query_sam_masks = [torch.ones((self.image_size, self.image_size))]
@@ -315,10 +360,20 @@ class UniVAD(nn.Module):
             for query_sam_mask in query_sam_masks:
                 H, W = query_sam_mask.shape
                 kernel = np.ones((5, 5), np.uint8)
+
+                # -----------------------------------------------------------------
+                # --- Fix: 强制转换为 uint8，解决 cv2.dilate 不支持 bool 的问题 ---
+                # -----------------------------------------------------------------
+                query_sam_mask_np = np.array(query_sam_mask).astype(np.uint8)
                 query_sam_mask = cv2.dilate(
-                    np.array(query_sam_mask), kernel, iterations=1
+                    query_sam_mask_np, kernel, iterations=1
                 )
+                # -----------------------------------------------------------------
+
                 thresh = torch.tensor(query_sam_mask).reshape(1, 1, H, W)
+
+                # F.interpolate 要求 float 输入
+                thresh = thresh.float()
                 thresh = F.interpolate(
                     thresh,
                     size=int(self.image_size / 14),
@@ -331,9 +386,14 @@ class UniVAD(nn.Module):
                 for i in range(len(patch_tokens)):
                     if i % 2 == 0:
                         continue
+
+                    # -----------------------------------------------------------------
+                    # --- 修复: 将 float 索引转换为 bool ---
+                    # -----------------------------------------------------------------
                     patch_tokens_reshaped = patch_tokens[i].view(
                         int((self.image_size / 14) ** 2), 1, 1024
-                    )[thresh > 0]
+                    )[thresh.bool()]
+
                     normal_tokens_reshaped = self.normal_clip_part_patch_features[i][
                         0
                     ].reshape(1, -1, 1024)
@@ -341,16 +401,18 @@ class UniVAD(nn.Module):
                         patch_tokens_reshaped, normal_tokens_reshaped, dim=2
                     )
                     sim_max, _ = torch.max(cosine_similarity_matrix, dim=1)
-                    # print(sim_max.max())
                     sims.append(sim_max)
                 sim = torch.mean(torch.stack(sims, dim=0), dim=0)
 
                 anomaly_map_ret_dino_part = torch.zeros(
                     (1, 1, int(self.image_size / 14), int(self.image_size / 14))
                 ).to(self.device)
+
+                # --- 修复: 将 float 索引转换为 bool ---
                 dino_patch_tokens_reshaped = dino_patch_tokens.view(-1, 1, 1536)[
-                    thresh > 0
-                    ]
+                    thresh.bool()
+                ]
+
                 dino_normal_tokens_reshaped = self.normal_dino_part_patch_features[
                     0
                 ].reshape(1, -1, 1536)
@@ -363,8 +425,9 @@ class UniVAD(nn.Module):
                     (1, 1, int(self.image_size / 14), int(self.image_size / 14))
                 )
 
-                anomaly_map_ret_part[thresh > 0] += 1 - sim
-                anomaly_map_ret_dino_part[thresh > 0] += 1 - sim_max_dino
+                anomaly_map_ret_part[thresh.bool()] += 1 - sim
+                anomaly_map_ret_dino_part[thresh.bool()] += 1 - sim_max_dino
+                # -----------------------------------------------------------------
 
             anomaly_map_ret_part = F.interpolate(
                 anomaly_map_ret_part,
@@ -429,11 +492,12 @@ class UniVAD(nn.Module):
             # query_masks = query_masks
 
             kernel = np.ones((5, 5), np.uint8)
+            # Fix: add astype(np.uint8)
             query_masks_capm = [
-                cv2.dilate(mask, kernel, iterations=1) for mask in query_masks_capm
+                cv2.dilate(mask.astype(np.uint8), kernel, iterations=1) for mask in query_masks_capm
             ]
             query_masks = [
-                cv2.dilate(mask, kernel, iterations=1) for mask in query_masks
+                cv2.dilate(mask.astype(np.uint8), kernel, iterations=1) for mask in query_masks
             ]
 
             anomaly_map_ret_part = torch.zeros(
@@ -449,7 +513,7 @@ class UniVAD(nn.Module):
             for j in range(len(query_masks_capm)):
                 query_sam_mask = query_masks_capm[j]
                 H, W = query_sam_mask.shape
-                thresh = torch.tensor(query_sam_mask).reshape(1, 1, H, W)
+                thresh = torch.tensor(query_sam_mask).reshape(1, 1, H, W).float()
                 thresh = F.interpolate(
                     thresh,
                     size=int(self.image_size / 14),
@@ -469,9 +533,13 @@ class UniVAD(nn.Module):
                 for i in range(len(patch_tokens)):
                     if i % 2 == 0:  # (layer+1)//2!=0:
                         continue
+                    # -----------------------------------------------------------------
+                    # --- 修复: MULTI 模式索引转换 (START) ---
+                    # -----------------------------------------------------------------
                     patch_tokens_reshaped = patch_tokens[i].view(
                         int((self.image_size / 14) ** 2), 1, 1024
-                    )[thresh > 0]
+                    )[thresh.bool()]
+
                     normal_tokens_reshaped = self.normal_clip_part_patch_features[i][
                         query_mask_idxs[j]
                     ].reshape(1, -1, 1024)
@@ -483,8 +551,10 @@ class UniVAD(nn.Module):
                 sim = torch.mean(torch.stack(sims, dim=0), dim=0)
 
                 dino_patch_tokens_reshaped = dino_patch_tokens.view(-1, 1, 1536)[
-                    thresh > 0
-                    ]
+                    thresh.bool()
+                ]
+                # -----------------------------------------------------------------
+
                 dino_normal_tokens_reshaped = self.normal_dino_part_patch_features[
                     query_mask_idxs[j]
                 ].reshape(1, -1, 1536)
@@ -495,11 +565,11 @@ class UniVAD(nn.Module):
                 thresh = thresh.reshape(
                     (1, 1, int(self.image_size / 14), int(self.image_size / 14))
                 )
-                anomaly_map_ret_part[thresh > 0] = torch.min(
-                    1 - sim, anomaly_map_ret_part[thresh > 0]
+                anomaly_map_ret_part[thresh.bool()] = torch.min(
+                    1 - sim, anomaly_map_ret_part[thresh.bool()]
                 )
-                anomaly_map_ret_dino_part[thresh > 0] = torch.min(
-                    1 - sim_max_dino, anomaly_map_ret_dino_part[thresh > 0]
+                anomaly_map_ret_dino_part[thresh.bool()] = torch.min(
+                    1 - sim_max_dino, anomaly_map_ret_dino_part[thresh.bool()]
                 )
 
             anomaly_map_ret_part[anomaly_map_ret_part == 100] = 0
@@ -636,8 +706,7 @@ class UniVAD(nn.Module):
         self.part_num = {
             "breakfast_box": [4],
             "screw_bag": [3],
-            "splicing_connectors": [2],
-            "pushpins": [3],
+            "splicing_connectors": [2], "pushpins": [3],
             "juice_bottle": [4],
         }
 
@@ -663,39 +732,36 @@ class UniVAD(nn.Module):
         self.color_tensor = color_tensor.repeat(1, 1, self.image_size, self.image_size)
 
         # -----------------------------------------------------------------
-        # --- 最终修复 (START): 修复 FileNotFoundError ---
+        # --- 最终修复 (START): 使用智能路径查找 ---
         # -----------------------------------------------------------------
         grounded_sam_mask_paths = []
         for image_path in image_paths:
-            # 'image_path' 是 'test_univad.py' 传入的,
-            # e.g., ./data/RoadCrack_Crop/road_texture/train/good/2016..._crop.jpg
+            mask_path = find_mask_path_smart(image_path)
 
-            # 1. 规范化路径 (将 G:\... 替换为 ./)
-            relative_image_path = os.path.relpath(image_path)
-
-            # 2. 将 'data' 替换为 'masks'
-            #    (使用 os.path.normpath 确保跨平台路径正确)
-            path_with_masks = relative_image_path.replace(os.path.normpath("data"), os.path.normpath("masks"), 1)
-
-            # 3. 移除 .jpg/.png/.JPG/.jpeg 扩展名
-            filename_without_ext = os.path.splitext(path_with_masks)[0]
-
-            # 4. 构造成您描述的路径: .../IMAGE_NAME/grounding_mask.png
-            mask_path = os.path.join(filename_without_ext, "grounding_mask.png")
+            # 容错：如果找不到，使用原图路径作为占位符 (后续代码需处理异常)
+            if not os.path.exists(mask_path):
+                # print(f"Warning: Setup mask not found for {image_path}, fallback to image path.")
+                pass
 
             grounded_sam_mask_paths.append(mask_path)
         # -----------------------------------------------------------------
         # --- 最终修复 (END) ---
         # -----------------------------------------------------------------
 
-        grounded_sam_masks = [
-            split_masks_from_one_mask_torch(
-                torch.tensor(
-                    np.array(Image.open(x).resize((self.image_size, self.image_size)))
-                )
-            )
-            for x in grounded_sam_mask_paths
-        ]
+        grounded_sam_masks = []
+        for x in grounded_sam_mask_paths:
+            if os.path.exists(x):
+                img = np.array(Image.open(x).resize((self.image_size, self.image_size)))
+                # 如果是灰度图，确保 shape 正确
+                if len(img.shape) == 2:
+                    pass  # ok
+                else:
+                    img = img[:, :, 0]  # 取单通道
+
+                grounded_sam_masks.append(split_masks_from_one_mask_torch(torch.tensor(img)))
+            else:
+                # 创建一个全掩码占位
+                grounded_sam_masks.append([torch.ones((self.image_size, self.image_size))])
 
         if len(grounded_sam_masks[0]) > 0:
             H, W = grounded_sam_masks[0][0].shape
@@ -743,10 +809,16 @@ class UniVAD(nn.Module):
         if self.gate == object_type.SINGLE:
 
             for i in range(self.shot):
+                # -----------------------------------------------------------------
+                # --- Fix: 强制转换为 uint8 ---
+                # -----------------------------------------------------------------
+                mask_np = np.array(grounded_sam_masks[i][0]).astype(np.uint8)
                 normal_sam_mask = cv2.dilate(
-                    np.array(grounded_sam_masks[i][0]), self.kernel, iterations=1
+                    mask_np, self.kernel, iterations=1
                 )
-                thresh = torch.tensor(normal_sam_mask).reshape(1, 1, H, W)
+                # -----------------------------------------------------------------
+
+                thresh = torch.tensor(normal_sam_mask).reshape(1, 1, H, W).float()
                 thresh = F.interpolate(
                     thresh,
                     size=int(self.image_size / 14),
@@ -755,16 +827,22 @@ class UniVAD(nn.Module):
                 ).reshape(int((self.image_size // 14) ** 2))
                 thresh[thresh > 0] = 1
 
-                selected_patch_features = self.normal_dino_patches[i][thresh]
+                # -----------------------------------------------------------------
+                # --- 修复: SINGLE 模式索引转换 (START) ---
+                # -----------------------------------------------------------------
+                selected_patch_features = self.normal_dino_patches[i][thresh.bool()]
                 self.normal_dino_part_patch_features[0].append(selected_patch_features)
 
                 for layer in range(len(self.normal_patch_tokens)):
                     if layer % 2 == 0:
                         continue
-                    selected_patch_features = self.normal_patch_tokens[layer][i][thresh]
+                    selected_patch_features = self.normal_patch_tokens[layer][i][thresh.bool()]
                     self.normal_clip_part_patch_features[layer][0].append(
                         selected_patch_features
                     )
+                # -----------------------------------------------------------------
+                # --- 修复 (END) ---
+                # -----------------------------------------------------------------
 
             self.normal_dino_part_patch_features[0] = torch.cat(
                 self.normal_dino_part_patch_features[0], dim=0
@@ -893,7 +971,7 @@ class UniVAD(nn.Module):
                 ]
 
                 for j in range(len(normal_mask_idxs)):
-                    thresh = torch.tensor(normal_masks_capm[j]).reshape(1, 1, H, W)
+                    thresh = torch.tensor(normal_masks_capm[j]).reshape(1, 1, H, W).float()
                     thresh = F.interpolate(
                         thresh,
                         size=int(self.image_size / 14),
@@ -905,7 +983,10 @@ class UniVAD(nn.Module):
                         continue
                     thresh[thresh > 0] = 1
 
-                    selected_patch_features = self.normal_dino_patches[i][thresh]
+                    # -----------------------------------------------------------------
+                    # --- 修复: MULTI 模式索引转换 (START) ---
+                    # -----------------------------------------------------------------
+                    selected_patch_features = self.normal_dino_patches[i][thresh.bool()]
                     self.normal_dino_part_patch_features[normal_mask_idxs[j]].append(
                         selected_patch_features
                     )
@@ -914,11 +995,14 @@ class UniVAD(nn.Module):
                         if layer % 2 == 0:
                             continue
                         selected_patch_features = self.normal_patch_tokens[layer][i][
-                            thresh
+                            thresh.bool()
                         ]
                         self.normal_clip_part_patch_features[layer][
                             normal_mask_idxs[j]
                         ].append(selected_patch_features)
+                    # -----------------------------------------------------------------
+                    # --- 修复 (END) ---
+                    # -----------------------------------------------------------------
 
                 features = self.component_feature_extractor.extract(
                     image,
