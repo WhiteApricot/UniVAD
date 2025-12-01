@@ -16,6 +16,7 @@ from PIL import Image
 from prefetch_generator import BackgroundGenerator
 import matplotlib.pyplot as plt  # <--- 新增：导入 matplotlib 用于绘图
 from UniVAD import UniVAD
+import gc  # 引入垃圾回收模块
 
 from datasets.mvtec import MVTecDataset
 from datasets.visa import VisaDataset
@@ -39,62 +40,108 @@ def resize_tokens(x):
     return x
 
 
-def cal_score(obj):
-    table = []
-    gt_px = []
-    pr_px = []
-    gt_sp = []
-    pr_sp = []
+# --- 将计算逻辑封装为独立函数，以便定期调用 ---
+def compute_and_print_metrics(results, obj_list, logger, is_final=False):
+    table_ls = []
+    auroc_sp_ls = []
+    auroc_px_ls = []
+    auprc_px_ls = []
 
-    table.append(obj)
-    for idxes in range(len(results["cls_names"])):
-        if results["cls_names"][idxes] == obj:
-            gt_px.append(results["imgs_masks"][idxes].squeeze(1).numpy())
-            pr_px.append(results["anomaly_maps"][idxes])
-            gt_sp.append(results["gt_sp"][idxes])
-            pr_sp.append(results["pr_sp"][idxes])
-    gt_px = np.array(gt_px)
-    gt_sp = np.array(gt_sp)
-    pr_px = np.array(pr_px)
-    pr_sp = np.array(pr_sp)
+    # 定义单个对象的计算逻辑
+    def cal_score_task(obj, results_dict, output_list):
+        # 筛选当前 obj 的数据
+        gt_px = []
+        pr_px = []
+        gt_sp = []
+        pr_sp = []
 
-    # -----------------------------------------------------------------
-    # --- 方案二修复 (START): 捕获样本级 AUROC 计算错误 ---
-    # -----------------------------------------------------------------
-    try:
-        auroc_sp = roc_auc_score(gt_sp, pr_sp)
-    except ValueError as e:
-        # logger 是在主线程中定义的，在线程中访问它
-        logger.warning(f"无法计算 {obj} 的 sample-level AUROC: {e}")
-        auroc_sp = np.nan  # 将无法计算的分数记为 nan
-    # -----------------------------------------------------------------
-    # --- 方案二修复 (END) ---
-    # -----------------------------------------------------------------
+        has_data = False
+        for idxes in range(len(results_dict["cls_names"])):
+            if results_dict["cls_names"][idxes] == obj:
+                gt_px.append(results_dict["imgs_masks"][idxes].squeeze(1).numpy())
+                pr_px.append(results_dict["anomaly_maps"][idxes])
+                gt_sp.append(results_dict["gt_sp"][idxes])
+                pr_sp.append(results_dict["pr_sp"][idxes])
+                has_data = True
 
-    # 像素级 AUROC
-    auroc_px = roc_auc_score(gt_px.ravel(), pr_px.ravel())
+        if not has_data:
+            return
 
-    # --- 修复 4 (START): 新增 AUPRC-PX 计算 ---
-    # 鉴于像素不平衡，AUPRC 是一个很好的补充指标
-    try:
-        auprc_px = average_precision_score(gt_px.ravel(), pr_px.ravel())
-    except ValueError as e:
-        logger.warning(f"无法计算 {obj} 的 pixel-level AUPRC: {e}")
-        auprc_px = np.nan
-    # --- 修复 4 (END) ---
+        gt_px = np.array(gt_px)
+        gt_sp = np.array(gt_sp)
+        pr_px = np.array(pr_px)
+        pr_sp = np.array(pr_sp)
 
-    table.append(str(np.round(auroc_sp * 100, decimals=1)))
-    table.append(str(np.round(auroc_px * 100, decimals=1)))
-    # --- 修复 4 (START): 添加 AUPRC-PX 到表格 ---
-    table.append(str(np.round(auprc_px * 100, decimals=1)))
-    # --- 修复 4 (END) ---
+        # -----------------------------------------------------------------
+        # --- 方案二修复: 捕获样本级 AUROC 计算错误 ---
+        # -----------------------------------------------------------------
+        try:
+            auroc_sp = roc_auc_score(gt_sp, pr_sp)
+        except ValueError:
+            auroc_sp = np.nan
 
-    table_ls.append(table)
-    auroc_sp_ls.append(auroc_sp)  # 添加计算出的值 (或 nan)
-    auroc_px_ls.append(auroc_px)
-    # --- 修复 4 (START): 添加 AUPRC-PX 到列表 ---
-    auprc_px_ls.append(auprc_px)
-    # --- 修复 4 (END) ---
+        # 像素级 AUROC
+        try:
+            auroc_px = roc_auc_score(gt_px.ravel(), pr_px.ravel())
+        except ValueError:
+            auroc_px = np.nan
+
+        # --- 修复 4: 新增 AUPRC-PX 计算 ---
+        try:
+            auprc_px = average_precision_score(gt_px.ravel(), pr_px.ravel())
+        except ValueError:
+            auprc_px = np.nan
+
+        # 将结果存入列表 (线程安全的方式通常建议用 append 到各自的 list，这里简化处理)
+        row = [
+            obj,
+            str(np.round(auroc_sp * 100, decimals=1)),
+            str(np.round(auroc_px * 100, decimals=1)),
+            str(np.round(auprc_px * 100, decimals=1))
+        ]
+
+        output_list.append({
+            "row": row,
+            "auroc_sp": auroc_sp,
+            "auroc_px": auroc_px,
+            "auprc_px": auprc_px
+        })
+
+    # 多线程执行
+    temp_results = []
+    threads = []
+    for obj in obj_list:
+        t = threading.Thread(target=cal_score_task, args=(obj, results, temp_results))
+        threads.append(t)
+        t.start()
+
+    for t in threads:
+        t.join()
+
+    # 整理结果
+    for res in temp_results:
+        table_ls.append(res["row"])
+        auroc_sp_ls.append(res["auroc_sp"])
+        auroc_px_ls.append(res["auroc_px"])
+        auprc_px_ls.append(res["auprc_px"])
+
+    # 计算均值 (忽略 nan)
+    if len(auroc_sp_ls) > 0:
+        table_ls.append(
+            [
+                "mean",
+                str(np.round(np.nanmean(auroc_sp_ls) * 100, decimals=1)),
+                str(np.round(np.nanmean(auroc_px_ls) * 100, decimals=1)),
+                str(np.round(np.nanmean(auprc_px_ls) * 100, decimals=1)),
+            ]
+        )
+
+    # 生成表格
+    headers = ["objects", "auroc_sp", "auroc_px", "auprc_px"]
+    results_table = tabulate(table_ls, headers=headers, tablefmt="pipe")
+
+    prefix = "[Final Result]" if is_final else "[Intermediate Result]"
+    logger.info(f"\n{prefix}\n{results_table}")
 
 
 if __name__ == "__main__":
@@ -119,6 +166,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--class_name", type=str, default="None", help="device")
     parser.add_argument("--device", type=str, default="cuda", help="device")
+
+    # --- 新增功能: 定期保存参数 ---
+    parser.add_argument("--save_interval", type=int, default=0, help="每N张图片输出一次结果 (0表示不输出)")
+
     args = parser.parse_args()
 
     dataset_name = args.dataset
@@ -279,7 +330,12 @@ if __name__ == "__main__":
         [transforms.Resize((image_size, image_size)), transforms.ToTensor()]
     )
 
+    # 计数器用于 save_interval
+    count = 0
+
     for items in tqdm(test_dataloader):
+        count += 1
+
         image = items["img"].to(device)
         image_pil = items["img_pil"]
         image_path = items["img_path"][0]
@@ -428,7 +484,6 @@ if __name__ == "__main__":
             # --- 新增功能: 逐像素可视化保存 (支持 k_shot 动态命名) ---
             # =================================================================
             # 1. 动态构建保存路径
-            # 格式: results/[Dataset]/[Class]/[K]shot_small_test/[Dataset]/
             vis_dir_name = f"{k_shot}shot_small_test"
             vis_save_path = os.path.join(
                 args.save_path,  # results/
@@ -464,58 +519,29 @@ if __name__ == "__main__":
 
             # 4. 保存
             file_name = os.path.basename(image_path)
-            # 替换扩展名以防混淆，或者直接使用原名
             save_full_path = os.path.join(vis_save_path, file_name)
             plt.savefig(save_full_path, bbox_inches='tight', pad_inches=0.1)
             plt.close(fig)
             # =================================================================
 
-    # metrics
-    table_ls = []
-    auroc_sp_ls = []
-    auroc_px_ls = []
-    # --- 修复 4 (START): 初始化 AUPRC-PX 列表 ---
-    auprc_px_ls = []
-    # --- 修复 4 (END) ---
+            # -----------------------------------------------------------------
+            # --- 内存管理修复 (关键修改) ---
+            # -----------------------------------------------------------------
+            # 手动删除不再需要的变量，并清理显存
+            del pred_value, anomaly_score, anomaly_map
+            # 同样删除可视化变量
+            del img_vis, gt_vis, score_vis
 
-    threads = [None] * 20
-    idx = 0
-    for obj in tqdm(obj_list):
-        threads[idx] = threading.Thread(target=cal_score, args=(obj,))
-        threads[idx].start()
-        idx += 1
+            # 清理 CUDA 缓存
+            torch.cuda.empty_cache()
+            # 如果内存依然紧张，可以取消下面这行的注释进行强制垃圾回收（会略微影响速度）
+            # gc.collect()
+            # -----------------------------------------------------------------
 
-    for i in range(idx):
-        threads[i].join()
+        # --- 定期输出结果 ---
+        if args.save_interval > 0 and count % args.save_interval == 0:
+            logger.info(f"\n[Process Log] Processed {count} images.")
+            compute_and_print_metrics(results, obj_list, logger, is_final=False)
 
-    # logger
-    # -----------------------------------------------------------------
-    # --- 方案二修复 (START): 使用 np.nanmean 忽略 nan 值计算均值 ---
-    # -----------------------------------------------------------------
-    table_ls.append(
-        [
-            "mean",
-            str(np.round(np.nanmean(auroc_sp_ls) * 100, decimals=1)),  # 使用 nanmean
-            str(np.round(np.nanmean(auroc_px_ls) * 100, decimals=1)),  # 使用 nanmean
-            # --- 修复 4 (START): 添加 AUPRC-PX 均值 ---
-            str(np.round(np.nanmean(auprc_px_ls) * 100, decimals=1)),  # 使用 nanmean
-            # --- 修复 4 (END) ---
-        ]
-    )
-    # -----------------------------------------------------------------
-    # --- 方案二修复 (END) ---
-    # -----------------------------------------------------------------
-
-    results = tabulate(
-        table_ls,
-        headers=[
-            "objects",
-            "auroc_sp",
-            "auroc_px",
-            # --- 修复 4 (START): 添加 AUPRC-PX 标题 ---
-            "auprc_px",
-            # --- 修复 4 (END) ---
-        ],
-        tablefmt="pipe",
-    )
-    logger.info("\n%s", results)
+    # 最终结果
+    compute_and_print_metrics(results, obj_list, logger, is_final=True)
